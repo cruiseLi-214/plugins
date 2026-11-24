@@ -512,8 +512,70 @@ fn share2(a: A) A {
 }
 
 pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
-    _ = a;
-    return .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"glm5_next\"}" }}, .block = "{\"quant_method\":\"exl3\",\"codebook\":\"mul1\"}" };
+    const files = try a.alloc(kit.sdk.fixture.File, 1 + config.bank_files.len);
+    files[0] = .{ .name = "config.json", .bytes = @embedFile("tests/fixtures/config.json") };
+    for (config.bank_files, files[1..]) |name, *slot| slot.* = .{ .name = name, .bytes = "" };
+    return .{ .files = files, .block = "{\"quant_method\":\"exl3\",\"codebook\":\"mul1\"}" };
+}
+
+fn replaceOnce(a: std.mem.Allocator, json: []const u8, old: []const u8, new: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, json, old) orelse return error.TestUnexpectedResult;
+    return std.mem.concat(a, u8, &.{ json[0..at], new, json[at + old.len ..] });
+}
+
+// Host expectQuant on the declared fixture: claim its block, refuse an empty block, validate its files.
+// Wrong family, codebook, and a missing bank or manifest are edits of that same fixture.
+test "turboexl3_glm53f conformance fixture: declared pack claims and validates; wrong family, codebook, or missing bank is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fx = try conformanceFixture(a);
+    const cfg = fx.file("config.json") orelse return error.TestUnexpectedResult;
+    const block = abi.Str.of(fx.block);
+    const config_json = abi.Str.of(cfg);
+
+    try std.testing.expectEqual(abi.Claim.by_marker, table.claims(block, config_json));
+    try std.testing.expectEqual(abi.Claim.no, table.claims(.of("{}"), .of("{}")));
+    try std.testing.expectEqual(abi.Claim.no, table.claims(block, .of("{\"model_type\":\"glm5_next\"}")));
+    try std.testing.expectEqualStrings("{\"quant_method\":\"exl3\",\"codebook\":\"mul1\"}", fx.block);
+    try std.testing.expectEqualStrings(@embedFile("tests/fixtures/config.json"), cfg);
+
+    var mem = kit.sdk.fixture.MemDir{ .files = fx.files };
+    const dir = mem.packDir();
+    try std.testing.expect(table.validate(block, config_json, &dir).isOk());
+    for (config.bank_files) |name| {
+        const bytes = fx.file(name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 0), bytes.len);
+    }
+
+    const wrong_family = try replaceOnce(a, cfg, "\"family\": \"turboexl3\"", "\"family\": \"mlx-stream\"");
+    try std.testing.expectEqual(abi.Claim.no, table.claims(block, .of(wrong_family)));
+
+    const bad_book = "{\"quant_method\":\"exl3\",\"codebook\":\"mcg\"}";
+    try std.testing.expectEqualStrings("turboexl3_glm53f: the codebook is not mul1", table.validate(.of(bad_book), config_json, &dir).why.slice());
+
+    var dropped = try a.alloc(kit.sdk.fixture.File, fx.files.len - 1);
+    var n: usize = 0;
+    for (fx.files) |f| {
+        if (std.mem.eql(u8, f.name, "experts.bin")) continue;
+        dropped[n] = f;
+        n += 1;
+    }
+    try std.testing.expectEqual(dropped.len, n);
+    var missing_bank = kit.sdk.fixture.MemDir{ .files = dropped };
+    const missing_bank_dir = missing_bank.packDir();
+    try std.testing.expectEqualStrings("turboexl3_glm53f: the pack lacks its banks (experts.bin, mtp-experts.bin and their manifests)", table.validate(block, config_json, &missing_bank_dir).why.slice());
+
+    n = 0;
+    for (fx.files) |f| {
+        if (std.mem.eql(u8, f.name, "expert-manifest-v2.json")) continue;
+        dropped[n] = f;
+        n += 1;
+    }
+    try std.testing.expectEqual(dropped.len, n);
+    var missing_manifest = kit.sdk.fixture.MemDir{ .files = dropped };
+    const missing_manifest_dir = missing_manifest.packDir();
+    try std.testing.expectEqualStrings("turboexl3_glm53f: the pack lacks its banks (experts.bin, mtp-experts.bin and their manifests)", table.validate(block, config_json, &missing_manifest_dir).why.slice());
 }
 
 test "turboexl3_glm53f: [stream-stats] splits the stream's own counters at the phase change" {
